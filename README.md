@@ -49,14 +49,14 @@ bash /path/to/tools/integrate-prs.sh
 | Key | What it does |
 |---|---|
 | **A** | Runs `git pullreqs --oneline`, removes the `#f` prefix (same as `sed 's/^#f //'`, also tolerating extra spaces and a plain `f ` prefix), and shows the PR numbers with their descriptions. Only lines that start with a PR number (4+ digits) are treated as PRs. A line that looks like a PR but has some other prefix is ignored with a warning, so nothing disappears silently PRs already handled in this session are tagged `[done]`, `[paused]` or `[failed]` |
-| **B** | Picks PRs in the **order you type them**. Type the PR numbers (e.g. `180641 180688 180689`, separated by spaces or commas). It loads the list first if you haven't pressed **A** yet, warns if a number is not in the listing (typo check), shows the exact order it will use, and asks `Proceed? [Y/n]` before running `git pullreqs -p <PR#>` for each |
+| **B** | Picks **any PR numbers, in any order**, in the order you type them. Separate them with spaces, commas or semicolons (e.g. `180641; 180605; 180688`); pasting your usual `git pullreqs -p 180641; git pullreqs -p 180605` line also works. Nothing is restricted: a number does not have to be in the listing, and it does not have to follow the listing order. It loads the list first if you haven't pressed **A**, shows the order it will use (flagging `[not in last listing]` or `[already integrated in this session]`), and asks `Proceed? [Y/n]` before running `git pullreqs -p <PR#>` for each. `git pullreqs -p` decides whether a PR is valid; an unknown number is reported as a failure and the next PR continues |
 | **C** | Picks every listed PR that is not already integrated in this session, in listing order, after a `[Y/n]` confirmation |
 | **R** | Resumes paused or unfinished PRs: reruns the pick and opens `git mergetool -y` (see below) |
 | **D** | Runs your `git drop` (no arguments) to show the currently picked PRs. It is read-only; the script never runs `git drop -n` |
 | **S** | Shows the session summary |
 | **Q** | Quits and prints the final summary. If PRs are still paused, it lists them and asks `Quit anyway? [y/N]` |
 
-You can use the menu repeatedly in one session: list, pick a few PRs, resume a paused one, list again, and so on. The session remembers what was integrated, so the same PR is never picked twice.
+You can use the menu repeatedly in one session: list, pick a few PRs, resume a paused one, list again, and so on. The session remembers what was integrated and marks it in the listing and in the pick preview, but it never stops you from picking a PR.
 
 ### Typical flow
 
@@ -221,7 +221,7 @@ Note: the session state lives only while the script runs. If you quit and restar
 - Only aborts the operation that is in progress (`cherry-pick`, `merge` or `revert --abort`). It never touches a rebase.
 - Never supplies or rewrites a commit message.
 - Never fetches, pulls, rebases or pushes.
-- Never picks the same PR twice in one session.
+- Flags (but does not block) a PR that was already integrated in this session. If you pick it again and the pick fails, e.g. as an empty pick, the earlier successful integration is kept in the summary.
 - Ctrl-C during a batch aborts only the current PR's cherry-pick and returns you to the menu.
 - Unattended runs use no stdin, no credential prompts and no editor, so they cannot hang.
 

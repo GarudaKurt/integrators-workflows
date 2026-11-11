@@ -27,9 +27,10 @@
 #
 #   On a terminal the script shows a menu:
 #     [A] List pull requests          runs  git pullreqs --oneline
-#     [B] Pick PR number(s)           type PR numbers (e.g. 180641 180688);
+#     [B] Pick PR number(s)           type any PR numbers in any order, separated by
+#                                     space , or ;  (e.g. 180641; 180605; 180688);
 #                                     runs  git pullreqs -p <PR#> for each,
-#                                     in the order typed
+#                                     in the order typed. Not limited to the list.
 #     [C] Pick ALL listed PRs         in listing order
 #     [R] Resume paused/unfinished    opens the merge tool for each
 #     [D] Show picked PRs             runs  git drop  (read-only)
@@ -84,7 +85,7 @@ STOPPED=0
 # State
 # ----------------------------------------------------------------------------
 declare -a PR_LIST=() ALL_PRS=()   # PR_LIST = PRs touched in this session
-declare -A LISTED=() PR_HASH=()
+declare -A LISTED=() PR_HASH=() COMMIT_PR=()   # COMMIT_PR: commit -> PR picked this session
 RESOLVED=(); UNLISTED=()
 CONFLICT_MODE=ask
 declare -A SEEN=() TITLE=() KIND=() REASON=() CONFLICT_FILES=() PR_AUTHOR=() PR_SUBJECT=()
@@ -194,6 +195,9 @@ classify_failure() {
         n=${#u[@]}
         FAIL_KIND=conflict
         FAIL_REASON="$n conflicting file(s): ${u[*]:0:5}$( ((n>5)) && echo ' ...')"
+    elif [[ $(op_in_progress) == cherry-pick ]] && grep -qiE 'now empty|nothing to commit|empty commit' <<<"$text"; then
+        FAIL_KIND=failed
+        FAIL_REASON="empty pick: its changes are already on your branch (exit $rc)"
     elif [[ $(op_in_progress) == cherry-pick ]] && grep -qiE "$PR_RE_CONFLICT" <<<"$text"; then
         FAIL_KIND=conflict
         FAIL_REASON="conflict reported by tool (no unmerged paths found)"
@@ -358,17 +362,14 @@ add_to_session() {
 # Pick the given PR numbers in order with `git pullreqs -p`.
 auto_phase() {
     local -a batch=("$@")
-    local pr idx=0 total=${#batch[@]} out rc head_before head_after
+    local pr idx=0 total=${#batch[@]} out rc head_before head_after prev
     ensure_clean || return 1
     for pr in "${batch[@]}"; do add_to_session "$pr"; done
     banner "PR INTEGRATION ($total PR(s))"
 
     for pr in "${batch[@]}"; do
         (( ++idx ))
-        if [[ ${KIND[$pr]} == ok || ${KIND[$pr]} == manual ]]; then
-            warn "[$idx/$total] PR $pr already integrated in this run; skipping duplicate."
-            continue
-        fi
+        prev=${KIND[$pr]:-}
         out="$TMP_DIR/$pr.auto.out"
         head_before=$(git rev-parse HEAD)
         log_raw "ATTEMPT $pr :: ${TITLE[$pr]}"
@@ -382,6 +383,7 @@ auto_phase() {
         if (( rc == 0 )); then
             KIND[$pr]=ok; unset 'REASON[$pr]'
             head_after=$(git rev-parse HEAD)
+            record_commits "$pr" "$head_before"
             if [[ $head_after == "$head_before" ]]; then
                 warn "PR $pr exited 0 but HEAD did not move (already applied or empty?)."
                 log_raw "NOTE    $pr exit 0 without new commit"
@@ -414,6 +416,9 @@ auto_phase() {
                 break
             fi
 
+            # A re-pick that fails must not undo an earlier successful integration.
+            [[ $prev == ok || $prev == manual ]] && KIND[$pr]=$prev
+
             # Repo is verified clean here. Ask what to do about a conflict.
             if (( was_conflict )) && [[ $ON_CONFLICT == ask ]]; then
                 handle_conflict_prompt "$pr" "$idx" "$total" || break
@@ -427,6 +432,32 @@ auto_phase() {
         fi
     done
     ON_CONFLICT=$CONFLICT_MODE      # [d] only applies to the batch it was chosen in
+}
+
+# Remember which commits a PR added, so a later conflict can name that PR.
+record_commits() {
+    local c
+    for c in $(git rev-list "$2..HEAD" 2>/dev/null); do COMMIT_PR[$c]=$1; done
+}
+
+# For each conflicting file: who last changed it on your branch, with the PR
+# number when that change came from a PR picked in this session.
+print_conflict_peers() {
+    local pr=$1 f h who subj owner
+    [[ -n ${CONFLICT_FILES[$pr]:-} ]] || return 0
+    printf '\n    Conflicts with (last change to each file on your branch):\n'
+    while IFS= read -r f; do
+        printf '      - %s\n' "$f"
+        h=$(git log -1 --format=%H HEAD -- "$f" 2>/dev/null)
+        if [[ -z $h ]]; then printf '          (no earlier history for this file)\n'; continue; fi
+        who=$(git log -1 --format='%an' "$h"); subj=$(git log -1 --format='%s' "$h")
+        owner=${COMMIT_PR[$h]:-}
+        if [[ -n $owner ]]; then
+            printf '          PR %s  %s  -  %s\n' "$owner" "$who" "$subj"
+        else
+            printf '          commit %s (not picked in this session)  %s  -  %s\n' "${h:0:7}" "$who" "$subj"
+        fi
+    done <<<"${CONFLICT_FILES[$pr]}"
 }
 
 # Print who/what/which-files for one PR.
@@ -467,10 +498,10 @@ show_conflict_info() {
         git show --stat --format='    %h  %an  %ad%n    %s' --date=short "$h" 2>/dev/null | head -30
     fi
     if [[ -n ${CONFLICT_FILES[$pr]:-} ]]; then
-        printf '\n  Last change to each conflicting file on your branch:\n'
+        printf '\n  Recent history of each conflicting file on your branch:\n'
         while IFS= read -r f; do
             printf '    %s\n' "$f"
-            git log -1 --format='      %h  %an  %ad  %s' --date=short HEAD -- "$f"
+            git log -3 --format='      %h  %an  %ad  %s' --date=short HEAD -- "$f"
         done <<<"${CONFLICT_FILES[$pr]}"
     fi
     printf '\n'
@@ -482,8 +513,17 @@ handle_conflict_prompt() {
     local pr=$1 idx=$2 total=$3 left=$(( $3 - $2 )) choice r
     printf '\n%s--- Merge conflict in PR %s (%d of %d) ---%s\n' "$C_YEL" "$pr" "$idx" "$total" "$C_RST"
     print_pr_details "$pr"
-    local held; held=$(for q in "${PR_LIST[@]}"; do [[ ${KIND[$q]} == conflict && $q != "$pr" ]] && echo "$q"; done | paste -sd' ' -)
-    printf '\n    Already paused: %s\n' "${held:-none}"
+    print_conflict_peers "$pr"
+    local q any=0 shared
+    for q in "${PR_LIST[@]}"; do
+        [[ ${KIND[$q]} == conflict && $q != "$pr" ]] || continue
+        (( any )) || { printf '\n    Already paused:\n'; any=1; }
+        printf '      PR %s  %s  -  %s\n' "$q" "${PR_AUTHOR[$q]:-?}" "${PR_SUBJECT[$q]:-${TITLE[$q]:0:60}}"
+        printf '          conflicting files: %s\n' "$(tr '\n' ' ' <<<"${CONFLICT_FILES[$q]:-}")"
+        shared=$(comm -12 <(sort <<<"${CONFLICT_FILES[$pr]:-}") <(sort <<<"${CONFLICT_FILES[$q]:-}") | tr '\n' ' ')
+        [[ -n ${shared// /} ]] && printf '          %sAlso conflicting in PR %s: %s%s\n' "$C_YEL" "$pr" "$shared" "$C_RST"
+    done
+    (( any )) || printf '\n    Already paused: none\n'
     printf '    %d PR(s) remain after this one. Repository is clean (conflict was aborted).\n\n' "$left"
     cat <<'EOF'
   [f] Fix it now, then continue with the remaining PRs
@@ -677,8 +717,9 @@ resolve_conflicts() {
 
 # Returns 0 handled (resolved or skipped), 2 user aborted interactive mode.
 resolve_pr_interactive() {
-    local pr=$1 out="$TMP_DIR/$1.interactive.out" rc r
+    local pr=$1 out="$TMP_DIR/$1.interactive.out" rc r head_before
     while true; do
+        head_before=$(git rev-parse HEAD)
         printf '\nRetrying PR: %s\n\n' "$pr"
         log_raw "RETRY   $pr"
         info "Executing git pullreqs -p $pr"
@@ -687,6 +728,7 @@ resolve_pr_interactive() {
 
         if (( rc == 0 )); then
             KIND[$pr]=ok; unset 'REASON[$pr]'
+            record_commits "$pr" "$head_before"
             success "PR $pr integrated successfully."
             log_raw "RESULT  $pr OK (retry)"
             return 0
@@ -699,6 +741,7 @@ resolve_pr_interactive() {
             resolve_conflicts; r=$?
             case $r in
                 0) KIND[$pr]=manual; unset 'REASON[$pr]'
+                   record_commits "$pr" "$head_before"
                    success "PR $pr integrated successfully."
                    log_raw "RESULT  $pr MANUAL_OK"
                    return 0 ;;
@@ -722,10 +765,11 @@ resolve_pr_interactive() {
 
 # Turn what the integrator typed into an ordered, de-duplicated list of PR numbers.
 #   resolve_tokens "<input>" <allow_unlisted 0|1> <universe PRs...>
-# Only PR numbers (e.g. 180641) are accepted, separated by spaces or commas.
+# Only PR numbers (e.g. 180641) are accepted, separated by spaces, commas or
+# semicolons. A pasted "git pullreqs -p 180641; git pullreqs -p 180605" works too.
 # Sets RESOLVED (in the order typed) and UNLISTED (numbers not in the universe).
 resolve_tokens() {
-    local input=${1//,/ } allow=$2; shift 2
+    local input=${1//[;,]/ } allow=$2; shift 2     # separators: space , ;
     local -a toks=()
     local -A inu=() got=()
     local tok pr
@@ -733,8 +777,10 @@ resolve_tokens() {
     for pr in "$@"; do inu[$pr]=1; done
     read -ra toks <<<"$input"
     for tok in "${toks[@]}"; do
-        if ! [[ $tok =~ ^[0-9]{4,}$ ]]; then
-            warn "'$tok' is not a PR number (expected digits such as 180641)."; return 1
+        # Allow a pasted "git pullreqs -p N; git pullreqs -p M" line: skip those words.
+        case $tok in git|pullreqs|-p) continue ;; esac
+        if ! [[ $tok =~ ^[0-9]+$ ]]; then
+            warn "'$tok' is not a PR number (digits only, e.g. 180641)."; return 1
         fi
         if [[ -z ${inu[$tok]:-} ]]; then
             if (( allow )); then UNLISTED+=("$tok")
@@ -787,23 +833,22 @@ menu_pick() {
     fi
     cat <<'EOF'
 
-Type one or more PR numbers, e.g.  180641 180688 180689
-PRs are picked in the order you type them.
+Type any PR numbers, in any order, separated by spaces, commas or semicolons:
+    180641; 180605; 180688
+(a pasted "git pullreqs -p 180641; git pullreqs -p 180605" line also works)
+PRs are picked in the order you type them; they do not have to be in the list.
 EOF
     read -r -p "PRs to pick (blank = cancel): " input || return 0
-    [[ -n ${input//[[:space:],]/} ]] || return 0
+    [[ -n ${input//[[:space:],;]/} ]] || return 0
     resolve_tokens "$input" 1 "${ALL_PRS[@]}" || { warn "Nothing was picked."; return 0; }
 
-    if (( ${#UNLISTED[@]} )); then
-        warn "Not in the last listing: ${UNLISTED[*]} (check for typos)"
-        read -r -p "Pick them anyway? [y/N] " a || return 0
-        [[ ${a,,} == y* ]] || { info "Nothing was picked."; return 0; }
-    fi
-
+    # Any PR number may be picked, in any order: nothing is blocked here. The
+    # preview only flags what is unusual, and `git pullreqs -p` has the last word.
     printf '\nWill pick, in this order:\n'
     for pr in "${RESOLVED[@]}"; do
-        (( ++i ))
-        case ${KIND[$pr]:-} in ok|manual) tag="[already done - will be skipped] " ;; *) tag="" ;; esac
+        (( ++i )); tag=""
+        [[ -z ${LISTED[$pr]:-} && ${#ALL_PRS[@]} -gt 0 ]] && tag="[not in last listing] "
+        case ${KIND[$pr]:-} in ok|manual) tag="[already integrated in this session] " ;; esac
         printf '  %d) %s  %s%s\n' "$i" "$pr" "$tag" "${TITLE[$pr]:0:80}"
     done
     read -r -p "Proceed? [Y/n] " a || return 0
