@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # integrate-prs.sh - Integrate all available pull requests with automatic
-# conflict skipping, a summary, and optional interactive conflict resolution.
+# conflict pausing, a summary, and optional interactive conflict resolution.
 #
 # WORKFLOW
 #   Phase 0  Preflight: refuse to start on a dirty / mid-operation repository.
@@ -22,23 +22,16 @@
 #   - Commit messages are never supplied or modified by this script.
 #
 # USAGE
-#   integrate-prs.sh [selection] [--on-conflict ask|defer] [--bottom-up]
-#                    [--dry-run] [--no-interactive] [--edit-message]
-#                    [--log-dir DIR] [-h|--help]
+#   integrate-prs.sh [--on-conflict ask|defer] [--dry-run] [--no-interactive]
+#                    [--edit-message] [--log-dir DIR] [-h|--help]
 #
-#   Selection (default: prompt, Enter = all):
-#     --last N          the last N PRs of the listing (the "bottom" N)
-#     --first N         the first N PRs of the listing
-#     --select SPEC     list positions, ranges or PR numbers, e.g. "16-20"
-#                       or "17,16" or "180605,180641" (processed in listing
-#                       order)
+#   Every PR shown by `git pullreqs --oneline` is processed, in listing order.
+#
 #   Conflict handling:
 #     --on-conflict ask    (default on a terminal) ask what to do at each
-#                          conflict: fix now / skip / defer all / stop
-#     --on-conflict defer  (default without a terminal) postpone every
-#                          conflict automatically
-#   --bottom-up           process the selection from the bottom of the
-#                         listing upwards instead of top-down
+#                          conflict: fix now / pause / pause all / stop
+#     --on-conflict defer  (default without a terminal) pause every
+#                          conflicting PR automatically
 #
 # EXIT CODES
 #   0 all PRs integrated     1 some PRs unfinished     2 preflight/usage error
@@ -58,6 +51,8 @@ if (( BASH_VERSINFO[0] < 4 )); then
     exit 2
 fi
 
+SCRIPT_NAME=${0##*/}
+
 # ----------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------
@@ -65,9 +60,7 @@ EDIT_MESSAGE=${PR_EDIT_MESSAGE:-0}
 LOG_DIR=${PR_LOG_DIR:-}
 DRY_RUN=0
 INTERACTIVE=1
-SELECT_SPEC=""
 ON_CONFLICT=""
-REVERSE=0
 STOPPED=0
 
 : "${PR_RE_CONFLICT:=CONFLICT|could not apply|after resolving the conflicts|merge conflict|fix conflicts}"
@@ -79,7 +72,7 @@ STOPPED=0
 # State
 # ----------------------------------------------------------------------------
 declare -a PR_LIST=() ALL_PRS=()
-declare -A SEEN=() TITLE=() KIND=() REASON=()
+declare -A SEEN=() TITLE=() KIND=() REASON=() CONFLICT_FILES=() PR_AUTHOR=() PR_SUBJECT=()
 # KIND values: ok | manual | conflict | failed | pending
 LOG_FILE=""
 TMP_DIR=""
@@ -89,6 +82,9 @@ FATAL=0
 MENU_CHOICE=""
 FAIL_KIND=""
 FAIL_REASON=""
+FAIL_FILES=""
+FAIL_AUTHOR=""
+FAIL_SUBJECT=""
 
 # ----------------------------------------------------------------------------
 # Output helpers
@@ -169,6 +165,13 @@ classify_failure() {
     text=$(<"$out")
     local -a u
     mapfile -t u < <(unmerged_files)
+    FAIL_FILES=""; FAIL_AUTHOR=""; FAIL_SUBJECT=""
+    (( ${#u[@]} )) && FAIL_FILES=$(printf '%s\n' "${u[@]}")
+    # Commit being applied (still readable here because nothing is aborted yet).
+    if git_path_exists CHERRY_PICK_HEAD; then
+        FAIL_AUTHOR=$(git log -1 --format='%an <%ae>' CHERRY_PICK_HEAD 2>/dev/null)
+        FAIL_SUBJECT=$(git log -1 --format='%s' CHERRY_PICK_HEAD 2>/dev/null)
+    fi
 
     if (( ${#u[@]} > 0 )); then
         n=${#u[@]}
@@ -205,11 +208,7 @@ parse_args() {
             --dry-run)        DRY_RUN=1 ;;
             --no-interactive) INTERACTIVE=0 ;;
             --edit-message)   EDIT_MESSAGE=1 ;;
-            --last)           shift; [[ ${1:-} =~ ^[0-9]+$ ]] || die 2 "--last needs a number"; SELECT_SPEC="last $1" ;;
-            --first)          shift; [[ ${1:-} =~ ^[0-9]+$ ]] || die 2 "--first needs a number"; SELECT_SPEC="first $1" ;;
-            --select)         shift; SELECT_SPEC=${1:-}; [[ -n $SELECT_SPEC ]] || die 2 "--select needs a value" ;;
             --on-conflict)    shift; ON_CONFLICT=${1:-}; [[ $ON_CONFLICT == ask || $ON_CONFLICT == defer ]] || die 2 "--on-conflict must be ask or defer" ;;
-            --bottom-up)      REVERSE=1 ;;
             --log-dir)        shift; LOG_DIR=${1:-}; [[ -n $LOG_DIR ]] || die 2 "--log-dir needs a value" ;;
             -h|--help)        usage; exit 0 ;;
             *)                die 2 "Unknown option: $1 (see --help)" ;;
@@ -242,7 +241,32 @@ preflight() {
     fi
     local untracked; untracked=$(git ls-files --others --exclude-standard | wc -l)
     (( untracked == 0 )) || warn "$untracked untracked file(s) present (left untouched)."
+    check_merge_tool_and_upstream
     info "Repository state OK. Log: $LOG_FILE"
+}
+
+# Informational checks only: nothing is fetched, pulled or changed.
+check_merge_tool_and_upstream() {
+    local up behind ahead ans
+    if [[ -z $(git config --get merge.tool) ]]; then
+        warn "merge.tool is not configured; 'git mergetool' may not open a tool."
+        warn "  Set one, e.g.: git config merge.tool meld   (or vimdiff, kdiff3, ...)"
+    fi
+    if up=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null); then
+        read -r behind ahead < <(git rev-list --left-right --count "$up...HEAD")
+        if (( behind > 0 )); then
+            warn "Local branch is $behind commit(s) behind $up (and $ahead ahead), as of your last fetch."
+            warn "  PRs will be applied on a stale base. Consider: git fetch && git pull --rebase"
+            if (( INTERACTIVE && ! DRY_RUN )) && [[ -t 0 ]]; then
+                read -r -p "Continue anyway? [y/N] " ans || ans=n
+                [[ ${ans,,} == y* ]] || die 2 "Update the branch first, then rerun."
+            fi
+        elif (( ahead > 0 )); then
+            info "Local branch is $ahead commit(s) ahead of $up (unpushed local commits are kept)."
+        fi
+    else
+        info "No upstream configured for this branch; skipping remote comparison."
+    fi
 }
 
 # Retrieve PRs, strip the '#f ' prefix, extract and de-duplicate PR numbers.
@@ -254,95 +278,30 @@ fetch_prs() {
     }
     while IFS= read -r line; do
         [[ -n ${line//[[:space:]]/} ]] || continue
-        read -r pr rest <<<"$line"
-        if ! [[ $pr =~ ^[0-9]+$ ]]; then
-            warn "Ignoring unparsable line: $line"; continue
+        # A PR line starts with its number. Anything else is the continuation of
+        # a multi-line description and is ignored (but kept in the log).
+        if ! [[ $line =~ ^[0-9]+([[:space:]]|$) ]]; then
+            log_raw "IGNORED non-PR line: ${line:0:120}"; continue
         fi
+        read -r pr rest <<<"$line"
         if [[ -n ${SEEN[$pr]:-} ]]; then
             warn "Duplicate PR $pr in listing; ignoring repeat."; continue
         fi
-        SEEN[$pr]=1; TITLE[$pr]=$rest
-        ALL_PRS+=("$pr")
+        SEEN[$pr]=1; TITLE[$pr]=$rest; KIND[$pr]=pending
+        ALL_PRS+=("$pr"); PR_LIST+=("$pr")
     done < <(sed 's/^#f //' <<<"$raw")
 }
 
 # ----------------------------------------------------------------------------
-# PR selection
+# PR list display
 # ----------------------------------------------------------------------------
 show_listing() {
     local i=0 pr
-    printf '\nAvailable PRs (listing order, %d total):\n' "${#ALL_PRS[@]}"
-    for pr in "${ALL_PRS[@]}"; do
-        (( ++i )); printf '  %2d) %s  %s\n' "$i" "$pr" "${TITLE[$pr]:0:80}"
+    printf '\nPRs to integrate (%d, listing order):\n' "${#PR_LIST[@]}"
+    for pr in "${PR_LIST[@]}"; do
+        (( ++i )); printf '  %2d) %s  %s\n' "$i" "$pr" "${TITLE[$pr]:0:90}"
     done
     printf '\n'
-}
-
-# Turn a selection spec into PR_LIST. Returns 1 if the spec is invalid.
-apply_selection() {
-    local spec=${1,,} n=${#ALL_PRS[@]} tok a b i pr k
-    local -a toks picked=()
-    local -A chosen=()
-    spec=${spec//,/ }
-    read -ra toks <<<"$spec"
-
-    if (( ${#toks[@]} == 0 )) || [[ ${toks[0]} == all ]]; then
-        picked=("${ALL_PRS[@]}")
-    elif [[ ${toks[0]} == last  && ${toks[1]:-} =~ ^[0-9]+$ ]] && (( toks[1] >= 1 )); then
-        k=${toks[1]}; (( k > n )) && k=$n; picked=("${ALL_PRS[@]:n-k:k}")
-    elif [[ ${toks[0]} == first && ${toks[1]:-} =~ ^[0-9]+$ ]] && (( toks[1] >= 1 )); then
-        k=${toks[1]}; (( k > n )) && k=$n; picked=("${ALL_PRS[@]:0:k}")
-    else
-        for tok in "${toks[@]}"; do
-            if [[ -n ${SEEN[$tok]:-} ]]; then                       # exact PR number
-                chosen[$tok]=1
-            elif [[ $tok =~ ^([0-9]+)-([0-9]+)$ ]]; then            # position range
-                a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
-                (( a >= 1 && a <= b && b <= n )) || { warn "Range '$tok' is outside 1-$n."; return 1; }
-                for (( i=a; i<=b; i++ )); do chosen[${ALL_PRS[i-1]}]=1; done
-            elif [[ $tok =~ ^[0-9]+$ ]] && (( tok >= 1 && tok <= n )); then   # position
-                chosen[${ALL_PRS[tok-1]}]=1
-            else
-                warn "'$tok' is not a listed PR number, position or range."; return 1
-            fi
-        done
-        for pr in "${ALL_PRS[@]}"; do [[ -n ${chosen[$pr]:-} ]] && picked+=("$pr"); done
-    fi
-
-    (( ${#picked[@]} )) || { warn "Selection is empty."; return 1; }
-    PR_LIST=()
-    if (( REVERSE )); then
-        for (( i=${#picked[@]}-1; i>=0; i-- )); do PR_LIST+=("${picked[i]}"); done
-    else
-        PR_LIST=("${picked[@]}")
-    fi
-    for pr in "${PR_LIST[@]}"; do KIND[$pr]=pending; done
-    return 0
-}
-
-select_prs() {
-    local ans
-    if [[ -n $SELECT_SPEC ]]; then
-        apply_selection "$SELECT_SPEC" || die 2 "Invalid selection: $SELECT_SPEC"
-        return
-    fi
-    if (( INTERACTIVE && ! DRY_RUN )) && [[ -t 0 ]]; then
-        show_listing
-        cat <<'EOF'
-Which PRs should be integrated?
-  Enter        all of them
-  last 5       the last 5 (bottom) PRs
-  first 3      the first 3 PRs
-  16-20        list positions 16 to 20
-  17,16        specific positions, or PR numbers such as 180605,180641
-EOF
-        while true; do
-            read -r -p "Selection: " ans || die 2 "No selection made."
-            apply_selection "$ans" && break
-        done
-    else
-        apply_selection "all"
-    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -380,8 +339,9 @@ auto_phase() {
         else
             classify_failure "$rc" "$out"
             KIND[$pr]=$FAIL_KIND; REASON[$pr]=$FAIL_REASON
+            CONFLICT_FILES[$pr]=$FAIL_FILES; PR_AUTHOR[$pr]=$FAIL_AUTHOR; PR_SUBJECT[$pr]=$FAIL_SUBJECT
             if [[ $FAIL_KIND == conflict ]]; then
-                warn "PR $pr: merge conflict - postponed. ($FAIL_REASON)"
+                warn "PR $pr: merge conflict - paused. ($FAIL_REASON)"
             else
                 warn "PR $pr: failed - $FAIL_REASON"
                 tail -n 5 "$out" | sed 's/^/    | /'
@@ -416,31 +376,66 @@ auto_phase() {
     done
 }
 
+# Print who/what/which-files for one PR.
+print_pr_details() {
+    local pr=$1 f n=0
+    printf '    PR:       %s\n' "$pr"
+    printf '    Listing:  %s\n' "${TITLE[$pr]:-(none)}"
+    if [[ -n ${PR_SUBJECT[$pr]:-} ]]; then
+        printf '    Author:   %s\n    Commit:   %s\n' "${PR_AUTHOR[$pr]}" "${PR_SUBJECT[$pr]}"
+    fi
+    if [[ -n ${CONFLICT_FILES[$pr]:-} ]]; then
+        n=$(grep -c . <<<"${CONFLICT_FILES[$pr]}")
+        printf '    Conflicting files (%d):\n' "$n"
+        while IFS= read -r f; do printf '      - %s\n' "$f"; done <<<"${CONFLICT_FILES[$pr]}"
+    fi
+}
+
+# Files that conflict in more than one paused PR (they will likely need fixing together).
+print_overlaps() {
+    local pr f any=0
+    local -A owners=()
+    for pr in "${PR_LIST[@]}"; do
+        [[ ${KIND[$pr]} == conflict && -n ${CONFLICT_FILES[$pr]:-} ]] || continue
+        while IFS= read -r f; do owners[$f]+="${owners[$f]:+, }$pr"; done <<<"${CONFLICT_FILES[$pr]}"
+    done
+    for f in "${!owners[@]}"; do
+        [[ ${owners[$f]} == *,* ]] || continue
+        (( any )) || { printf '\nFiles conflicting in more than one paused PR:\n'; any=1; }
+        printf '  %s  <-  PR %s\n' "$f" "${owners[$f]}"
+    done
+}
+
 # Ask what to do about a conflict that has just been postponed.
 # Returns 0 to continue with the remaining PRs, 1 to stop the run.
 handle_conflict_prompt() {
     local pr=$1 idx=$2 total=$3 left=$(( $3 - $2 )) choice r
     printf '\n%s--- Merge conflict in PR %s (%d of %d) ---%s\n' "$C_YEL" "$pr" "$idx" "$total" "$C_RST"
-    printf '    %s\n' "${REASON[$pr]}"
+    print_pr_details "$pr"
+    local held; held=$(for q in "${PR_LIST[@]}"; do [[ ${KIND[$q]} == conflict && $q != "$pr" ]] && echo "$q"; done | paste -sd' ' -)
+    printf '\n    Already paused: %s\n' "${held:-none}"
     printf '    %d PR(s) remain after this one. Repository is clean (conflict was aborted).\n\n' "$left"
     cat <<'EOF'
   [f] Fix it now, then continue with the remaining PRs
   [x] Fix it now, then STOP (remaining PRs are not integrated)
-  [s] Skip this PR (retry later) and continue
-  [d] Skip this and ALL future conflicts automatically
+  [p] PAUSE this PR (hold it for later) and continue with the rest
+  [d] PAUSE this and ALL future conflicting PRs automatically
   [a] Abort the run now (remaining PRs are not integrated)
 EOF
     while true; do
         INTERRUPTED=0
-        read -r -p "Choice [f/x/s/d/a]: " choice || choice=a
-        case ${choice,,} in f|x|s|d|a) break ;; esac
+        read -r -p "Choice [f/x/p/d/a]: " choice || choice=a
+        case ${choice,,} in f|x|p|d|a) break ;; s) choice=p; break ;; esac
     done
     choice=${choice,,}
     log_raw "PROMPT  $pr conflict choice=$choice"
 
     case $choice in
-        s) return 0 ;;
-        d) ON_CONFLICT=defer; info "Future conflicts will be postponed automatically."; return 0 ;;
+        p) warn "PR $pr paused; continuing with the remaining PRs."
+           log_raw "RESULT  $pr PAUSED_BY_USER"; return 0 ;;
+        d) ON_CONFLICT=defer
+           warn "PR $pr paused. Future conflicting PRs will be paused automatically."
+           log_raw "RESULT  $pr PAUSED_BY_USER (pause-all enabled)"; return 0 ;;
         a) STOPPED=1; warn "Run aborted by user."; return 1 ;;
         f|x)
             resolve_pr_interactive "$pr"; r=$?
@@ -469,9 +464,9 @@ print_summary() {
     printf '\n========================================\n'
     printf '       PR INTEGRATION SUMMARY\n'
     printf '========================================\n\n'
-    printf 'Total PRs:           %d (selected from %d available)\n' "${#PR_LIST[@]}" "${#ALL_PRS[@]}"
+    printf 'Total PRs:           %d\n' "${#PR_LIST[@]}"
     printf 'Successful:          %d' $((ok + man)); (( man )) && printf ' (%d manually resolved)' "$man"; printf '\n'
-    printf 'Merge Conflicts:     %d\n' "$conf"
+    printf 'Paused (conflict):  %d\n' "$conf"
     printf 'Other Failures:      %d\n' "$fail"
     (( pend )) && printf 'Not Processed:       %d\n' "$pend"
 
@@ -488,11 +483,23 @@ print_summary() {
         printf '\nUnfinished PRs:\n'
         for pr in "${PR_LIST[@]}"; do
             case ${KIND[$pr]} in
-                conflict) printf '  %s[CONFLICT]%s %s\n'        "$C_YEL" "$C_RST" "$pr" ;;
+                conflict) printf '  %s[PAUSED]%s   %s  - conflict: %s\n' "$C_YEL" "$C_RST" "$pr" "${REASON[$pr]:-}" ;;
                 failed)   printf '  %s[FAILED]%s   %s  - %s\n'  "$C_RED" "$C_RST" "$pr" "${REASON[$pr]:-}" ;;
                 pending)  printf '  [NOT RUN]  %s\n' "$pr" ;;
             esac
         done
+    fi
+    if (( conf )); then
+        printf '\nPAUSED PRs - DETAILS\n'
+        for pr in "${PR_LIST[@]}"; do
+            [[ ${KIND[$pr]} == conflict ]] || continue
+            printf '\n'; print_pr_details "$pr"
+        done
+        print_overlaps
+    fi
+    if (( conf + fail + pend )); then
+        printf '\nTo retry a paused PR manually later:\n'
+        for pr in $(unfinished_prs); do printf '  git pullreqs -p %s   # then: git mergetool -y\n' "$pr"; done
     fi
     printf '\nStarting HEAD: %s\nLog: %s\n' "${START_HEAD:0:10}" "$LOG_FILE"
     printf '========================================\n'
@@ -611,6 +618,7 @@ resolve_pr_interactive() {
         fi
 
         classify_failure "$rc" "$out"
+        CONFLICT_FILES[$pr]=$FAIL_FILES; PR_AUTHOR[$pr]=$FAIL_AUTHOR; PR_SUBJECT[$pr]=$FAIL_SUBJECT
         if [[ $FAIL_KIND == conflict ]]; then
             warn "Merge conflict detected."
             resolve_conflicts; r=$?
@@ -645,12 +653,12 @@ interactive_phase() {
 
     cat <<'EOF'
 
-Some pull requests were not integrated successfully.
+Some pull requests are paused or unfinished.
 
-Would you like to retry the unfinished PRs
+Would you like to resume them now
 in interactive conflict resolution mode?
 
-[1] Yes - Retry unfinished PRs
+[1] Yes - Resume paused/unfinished PRs
 [2] Select specific PRs to retry
 [3] No - Exit and display summary
 
@@ -695,11 +703,10 @@ main() {
 
     fetch_prs
     if (( ${#ALL_PRS[@]} == 0 )); then info "No pull requests available."; exit 0; fi
-    select_prs
-    info "Selected ${#PR_LIST[@]} of ${#ALL_PRS[@]} PR(s): ${PR_LIST[*]}"
+    show_listing
 
     if (( DRY_RUN )); then
-        local pr; for pr in "${PR_LIST[@]}"; do printf '  %s  %s\n' "$pr" "${TITLE[$pr]}"; done
+        info "Dry run: nothing was integrated."
         exit 0
     fi
 
